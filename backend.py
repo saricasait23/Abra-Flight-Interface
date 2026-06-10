@@ -7,7 +7,6 @@ from pymavlink import mavutil
 
 app = FastAPI()
 
-# Başlangıçta sistem tamamen kapalı ve sıfırlanmış durumda (Simülasyon YOK)
 def create_blank_drone(id, name):
     return {
         "id": id, "name": name, "isScout": id == 1, "status": "OFFLINE", "mode": "UNKNOWN",
@@ -24,9 +23,10 @@ swarm_data = [
 
 connections = {}
 is_connected = False
+console_queue = [] # Arayüzdeki MAVLink Terminali için mesaj kuyruğu
 
 async def mavlink_listener():
-    """Gerçek araçlardan gelen MAVLink verilerini okur (Blocking olmadan)"""
+    """Uçuş kontrolcülerinden gelen MAVLink paketlerini dinler"""
     global is_connected
     while True:
         if is_connected and connections:
@@ -39,13 +39,10 @@ async def mavlink_listener():
                     msg_type = msg.get_type()
                     idx = drone_id - 1
 
-                    # Gerçek telemetri atamaları
                     if msg_type == 'GLOBAL_POSITION_INT':
                         swarm_data[idx]["lat"] = msg.lat / 1e7
                         swarm_data[idx]["lon"] = msg.lon / 1e7
                         swarm_data[idx]["alt"] = msg.alt / 1000.0
-                        
-                        # Anlık hız (X, Y, Z vektörlerinden bileşke hız)
                         vx, vy, vz = msg.vx / 100.0, msg.vy / 100.0, msg.vz / 100.0
                         swarm_data[idx]["speed"] = math.sqrt(vx**2 + vy**2 + vz**2)
                     
@@ -68,14 +65,15 @@ async def mavlink_listener():
                             swarm_data[idx]["status"] = "ARMED"
                         else:
                             swarm_data[idx]["status"] = "DISARMED"
-                            
-                        # Custom Mode ayrıştırması eklenebilir (ArduPilot vs PX4)
                         swarm_data[idx]["mode"] = "ONLINE" 
+                        
+                    elif msg_type == 'STATUSTEXT':
+                        text = msg.text
+                        console_queue.append(f"[UAV-{drone_id}] {text}")
 
-                except Exception as e:
-                    print(f"Telemetry Read Error on UAV-{drone_id}: {e}")
-        
-        await asyncio.sleep(0.01) # Yüksek frekanslı donanım okuma döngüsü
+                except Exception:
+                    pass
+        await asyncio.sleep(0.01)
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
@@ -83,17 +81,27 @@ async def websocket_endpoint(websocket: WebSocket):
     global is_connected
     
     async def send_telemetry():
+        """Arayüze hem araç verilerini hem de terminal loglarını yollar"""
         try:
             while True:
-                # Sadece bağlıysa ve araç aktifse veriyi gönder, yoksa boş gönder
                 formatted_data = [{**iha, "battery": round(iha["battery"], 1), "alt": round(iha["alt"], 1), "speed": round(iha["speed"], 1), "power_W": round(iha["power_W"], 1), "hdop": round(iha["hdop"], 2)} for iha in swarm_data]
                 
-                await websocket.send_text(json.dumps(formatted_data))
-                await asyncio.sleep(0.2) # 5Hz Arayüz Yenileme
+                payload = {
+                    "type": "telemetry",
+                    "data": formatted_data
+                }
+                
+                if console_queue:
+                    payload["console"] = list(console_queue)
+                    console_queue.clear()
+
+                await websocket.send_text(json.dumps(payload))
+                await asyncio.sleep(0.2)
         except Exception:
             pass
 
     async def receive_commands():
+        """Arayüzden gelen komutları işler"""
         global is_connected
         try:
             while True:
@@ -102,73 +110,65 @@ async def websocket_endpoint(websocket: WebSocket):
                 action = cmd['action']
                 target = cmd.get('target')
 
-                print(f"UI COMMAND RECEIVED: {action}")
-
                 if action == "CONNECT":
-                    print("Connecting to Real UAVs via TCP...")
-
-                    # Frontend CONNECT target olarak artık { host, port } gönderiyor.
-                    # Eski string formatı gelirse de bozulmasın diye iki formatı da destekliyoruz.
                     if isinstance(target, dict):
-                        base_ip = target.get("host") or "192.168.30.11"
-                        port = int(target.get("port") or 5760)
+                        base_ip = target.get("host", "192.168.30.11")
+                        port = target.get("port", 5760)
                     else:
                         base_ip = target if target else "192.168.30.11"
                         port = 5760
 
-                   # base_ip_prefix = base_ip.rsplit('.', 1)[0] # "192.168.30" kısmını alır
-
-                    #for i in range(1, 4): # 3 araç için bağlantı denemesi
-                     #   ip = f"{base_ip_prefix}.{10 + i}" # 192.168.30.11, .12, .13 mantığı
-                      #  try:
-                       #     conn = mavutil.mavlink_connection(f'tcp:{ip}:{port}', autoreconnect=True)
-                        #    conn.wait_heartbeat(timeout=3)
-                         #   connections[i] = conn
-                          #  swarm_data[i-1]["status"] = "CONNECTED"
-                           # print(f"Connected to UAV-{i} at {ip}:{port}")
-                       # except Exception as e:
-                        #    print(f"Failed to connect UAV-{i} at {ip}:{port}: {e}")
-                         #   swarm_data[i-1]["status"] = "OFFLINE"
-                    # SITL localhost ise portları 5760, 5770, 5780 olarak dener.
-# Gerçek drone IP ise 192.168.30.11, .12, .13 mantığıyla çalışır.
                     if base_ip in ["127.0.0.1", "localhost"]:
-                        connection_targets = [
-                            ("udpin:127.0.0.1:14550", 1),
-                            ("udpin:127.0.0.1:14560", 2),
-                            ("udpin:127.0.0.1:14570", 3),
-                        ]
+                        # SIMÜLASYON (SITL) BAĞLANTISI
+                        console_queue.append(">> SITL SIMULATION LINK INITIALIZED")
+                        successful_conns = 0
+                        ports = [14550, 14560, 14570]
+                        for i in range(1, 4):
+                            try:
+                                connections[i] = mavutil.mavlink_connection(f'udpin:0.0.0.0:{ports[i-1]}')
+                                swarm_data[i-1]["status"] = "CONNECTED"
+                                successful_conns += 1
+                            except Exception:
+                                swarm_data[i-1]["status"] = "OFFLINE"
+                        if successful_conns > 0:
+                            is_connected = True
                     else:
-                        base_ip_prefix = base_ip.rsplit(".", 1)[0]
-                        connection_targets = [
-                            (f"tcp:{base_ip_prefix}.11:{port}", 1),
-                            (f"tcp:{base_ip_prefix}.12:{port}", 2),
-                            (f"tcp:{base_ip_prefix}.13:{port}", 3),
-                        ]
-
-                    for conn_str, drone_id in connection_targets:
+                        # GERÇEK SAHA BAĞLANTISI
+                        console_queue.append(f">> HEDEF ARANIYOR: {base_ip}:{port}")
                         try:
-                            conn = mavutil.mavlink_connection(conn_str, autoreconnect=True)
-                            conn.wait_heartbeat(timeout=5)
-
-                            connections[drone_id] = conn
-                            swarm_data[drone_id - 1]["status"] = "CONNECTED"
-
-                            print(f"Connected to UAV-{drone_id} via {conn_str}")
-
+                            # 1. Aşama: Sadece arayüze yazdığın hedefe TCP kapısı aç
+                            conn = mavutil.mavlink_connection(f'tcp:{base_ip}:{port}')
+                            
+                            # 2. Aşama: Otopilottan MAVLink Heartbeat (Kalp Atışı) gelene kadar bekle
+                            console_queue.append(">> HEARTBEAT (KALP ATIŞI) BEKLENİYOR...")
+                            msg = conn.wait_heartbeat(timeout=3.0)
+                            
+                            if msg:
+                                # Bağlantı başarılı! IP'yi UAV-1'e ata ve sistemi başlat.
+                                connections[1] = conn
+                                swarm_data[0]["status"] = "CONNECTED"
+                                is_connected = True
+                                console_queue.append(f"✓ BAĞLANTI KESİN OLARAK ONAYLANDI: {base_ip}")
+                            else:
+                                # Kapı açıldı ama içeride dron yok veya cevap vermiyor
+                                is_connected = False
+                                swarm_data[0]["status"] = "OFFLINE"
+                                console_queue.append(f"❌ HATA: CİHAZ BULUNAMADI VEYA CEVAP VERMİYOR")
+                                await websocket.send_text(json.dumps({"type": "connection_failed"}))
+                                
                         except Exception as e:
-                            print(f"Failed to connect UAV-{drone_id} via {conn_str}: {e}")
-                            swarm_data[drone_id - 1]["status"] = "OFFLINE"
-
-                    is_connected = True
+                            # Ağda cihaza ulaşılamadı (Örn: Yanlış IP veya Güvenlik Duvarı engeli)
+                            is_connected = False
+                            console_queue.append(f"⚠️ AĞ HATASI: {e}")
+                            await websocket.send_text(json.dumps({"type": "connection_failed"}))
                 
                 elif action == "DISCONNECT":
                     connections.clear()
                     is_connected = False
                     for iha in swarm_data:
                         iha["status"] = "OFFLINE"
-                    print("Disconnected from all UAVs.")
+                    console_queue.append(">> ALL CONNECTIONS TERMINATED")
 
-                # GERÇEK UÇUŞ KOMUTLARI (UPLINK)
                 elif action == "ARM" and is_connected:
                     for conn in connections.values():
                         conn.mav.command_long_send(conn.target_system, conn.target_component, mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM, 0, 1, 0, 0, 0, 0, 0, 0)
@@ -179,14 +179,38 @@ async def websocket_endpoint(websocket: WebSocket):
                 
                 elif action == "TAKEOFF" and is_connected:
                     for conn in connections.values():
+                        conn.mav.set_mode_send(conn.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 4) 
+                        asyncio.sleep(0.5)
                         conn.mav.command_long_send(conn.target_system, conn.target_component, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF, 0, 0, 0, 0, 0, 0, 0, 20)
                 
-                elif action == "RTL" and is_connected:
+                elif action == "SMART_RTL" and is_connected:
                     for conn in connections.values():
-                        conn.mav.command_long_send(conn.target_system, conn.target_component, mavutil.mavlink.MAV_CMD_NAV_RETURN_TO_LAUNCH, 0, 0, 0, 0, 0, 0, 0, 0)
+                        conn.mav.set_mode_send(conn.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 21)
+
+                elif action == "WRITE_PARAM" and is_connected:
+                    param_id = target.get("param_id")
+                    param_value = float(target.get("param_value"))
+                    console_queue.append(f">> SWARM PARAM WRITE INITIATED: {param_id} -> {param_value}")
+                    for drone_id, conn in connections.items():
+                        try:
+                            conn.mav.param_set_send(conn.target_system, conn.target_component, param_id.encode('utf-8'), param_value, mavutil.mavlink.MAV_PARAM_TYPE_REAL32)
+                        except Exception:
+                            pass
+
+                elif action == "FLY_TO" and is_connected:
+                    lat = target.get("lat")
+                    lon = target.get("lon")
+                    alt = target.get("alt")
+                    console_queue.append(f">> COMMAND: GUIDED FLY-TO TARGET: {lat:.4f}, {lon:.4f}")
+                    for conn in connections.values():
+                        try:
+                            conn.mav.set_mode_send(conn.target_system, mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, 15)
+                            conn.mav.mission_item_int_send(conn.target_system, conn.target_component, 0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT, 2, 0, 0, 0, 0, 0, int(lat * 1e7), int(lon * 1e7), alt)
+                        except Exception:
+                            pass
 
         except Exception as e:
-            print(f"WebSocket Error: {e}")
+            pass
 
     task1 = asyncio.create_task(send_telemetry())
     task2 = asyncio.create_task(receive_commands())
